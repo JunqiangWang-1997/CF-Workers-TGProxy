@@ -69,6 +69,18 @@ const mkStream = ({ secret, emit, onClose }) => { let hdr = nil, cIn = null, cOu
   const push = (v) => { if (closed) return Promise.reject(Error()); const job = { bytes: u8(v) }; uq.add(job); chain = chain.then(async () => { if (closed) throw Error(); if (!job.bytes) return job.result; const jobs = [job]; let n = job.bytes.byteLength; for (const next of uq) { if (next === job) continue; if (n >= CFG.upPack || n + next.bytes.byteLength > CFG.upPack) break; n += next.bytes.byteLength; jobs.push(next); } const b = jobs.length === 1 ? job.bytes : cat(...jobs.map(x => x.bytes)); for (const item of jobs) { uq.delete(item); item.bytes = null; } const out = await feed(b); for (const item of jobs) item.result = out; return out; }); return chain; };
   const feed = async (b) => { if (closed) throw Error(); if (init && peer.closed) return false; if (!b.byteLength) return; if (!init) { const need = 64 - hdr.byteLength; if (b.byteLength < need) { hdr = cat(hdr, b); return; } hdr = cat(hdr, b.subarray(0, need)); await start(); const rest = b.subarray(need); if (rest.byteLength) return write(rest); return; } return write(b); };
   const start = async () => { const raw = hdr; const cr = await cipher(raw, secret, false); const plain = await cr.crypt(raw); if (closed) return; const info = headOf(plain); const head = mkHead(info.mode, info.target, info.media); const [cw, out, kr] = await Promise.all([ cipher(raw, secret, true), wireHead(head), cipher(head, nil, true), ]); if (closed) return; const kws = await dial({ target: info.target, media: info.media, signal: ac.signal, }); if (closed) { kws.close(); return; } peer = kws; cIn = cr; cOut = cw; kOut = out.cipher; kIn = kr; pkt = mkPkt(info.mode); await kws.write(out.wire); if (closed) return; hdr = nil; init = true; pump().catch(() => close()); };
+  /**
+   * Decrypt client data after the handshake and forward complete MTProto packets,
+   * re-encrypted for the upstream peer. Buffer incomplete packets for later calls.
+   * Send each packet batch in one write, targeting CFG.upPack bytes (20 KiB);
+   * a single larger packet is sent intact.
+   *
+   * @param {Uint8Array} raw - Encrypted client bytes, possibly spanning partial packets.
+   * @returns {Promise<void|false>} Resolves without a value after processing, or with
+   * false when stream or peer closure is detected, including after a failed write.
+   * @throws {Error} Rejects on cryptographic or packet-validation errors, or on an
+   * upstream write error when neither the stream nor the peer is closed.
+   */
   const write = async (raw) => { if (closed || peer.closed) return false; const plain = await cIn.crypt(raw); if (closed || peer.closed) return false; const pkts = pkt.push(plain); for (let start = 0; start < pkts.length;) { let end = start + 1, n = pkts[start].byteLength; while (end < pkts.length && n + pkts[end].byteLength <= CFG.upPack) { n += pkts[end++].byteLength; } const first = pkts[start]; const b = end === start + 1 ? first : new Uint8Array(first.buffer, first.byteOffset, n); if (closed || peer.closed) return false; const wire = await kOut.crypt(b); try { await peer.write(wire); } catch (err) { if (closed || peer.closed) return false; throw err; } start = end; } };
   const pump = async () => { while (!closed) { const b = await peer.readPack(); if (closed) return; if (!b) return close(); const plain = await kIn.crypt(b); if (closed) return; const raw = await cOut.crypt(plain); if (closed) return; await emit(raw); } };
   const close = () => { if (closed) return; closed = true; ac.abort(); try { peer?.close(); } catch {} for (const job of uq) job.bytes = null; uq.clear(); hdr = nil; pkt?.clear(); cIn = cOut = kIn = kOut = peer = null; try { onClose(); } catch {} }; return { push, close }; };
